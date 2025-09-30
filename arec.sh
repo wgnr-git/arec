@@ -17,7 +17,6 @@ RESET="\033[0m"
 # ═══════════════════════════════════════════════════════════════════════════
 
 SPLIT_TIME=1800               # Длительность одного файла в секундах (30 минут)
-OVERLAP_TIME=5               # Время перекрытия между файлами в секундах
 OUTPUT_DIR="/root/arec"       # Папка для сохранения записанных файлов
 LOG_FILE="/root/arec/arec.log" # Файл для записи логов работы скрипта
 SAMPLE_RATE=48000             # Частота дискретизации аудио (Гц)
@@ -39,7 +38,7 @@ CLOUD_SERVICE="yandex"        # Облачный сервис: google, yandex, n
 DELETE_AFTER_UPLOAD=true      # Удалять файлы после успешной выгрузки
 RETRY_DELAY=300               # Задержка между попытками загрузки (секунды)
 MAX_RETRIES=15                # Максимальное количество попыток загрузки
-CONNECTIVITY_CHECK_INTERVAL=300 # Интервал проверки интернет-соединения (секунды)
+CONNECTIVITY_CHECK_INTERVAL=180 # Интервал проверки интернет-соединения (секунды)
 PENDING_DIR="/root/arec/pending" # Папка для файлов в очереди на загрузку
 MAX_STORAGE_MB=40960          # Максимальный размер локального хранилища (МБ)
 CONNECTIVITY_TIMEOUT=10       # Таймаут проверки сетевого соединения (секунды)
@@ -222,52 +221,6 @@ sync_time() {
     fi
 }
 
-# Функция проверки состояния микрофона
-check_microphone_health() {
-    local exit_code
-    
-    # Проверяем доступность микрофона через arecord
-    if ! arecord -D "$MIC" -f "$SAMPLE_FORMAT" -r "$SAMPLE_RATE" -d 1 --quiet - >/dev/null 2>&1; then
-        exit_code=$?
-        log_error "arecord не может получить доступ к микрофону $MIC (код: $exit_code)" "$exit_code" "mic_check"
-        return 1
-    fi
-    
-    return 0
-}
-
-# Функция восстановления микрофона
-restore_microphone() {
-    local attempts=0
-    local max_attempts=3
-    local exit_code
-    
-    log_message "Попытка восстановления микрофона..."
-    
-    while [ $attempts -lt $max_attempts ]; do
-        attempts=$((attempts + 1))
-        log_message "Попытка восстановления $attempts/$max_attempts"
-        
-        # Перезагружаем ALSA
-        if ! alsactl restore >/dev/null 2>&1; then
-            log_error "Ошибка восстановления ALSA" "alsa_restore_failed" "mic_restore"
-        fi
-        sleep 2
-        
-        # Проверяем восстановление
-        if check_microphone_health; then
-            log_message "Микрофон успешно восстановлен"
-            return 0
-        fi
-        
-        log_error "Попытка восстановления $attempts неудачна" "restore_attempt_failed" "mic_restore"
-        sleep 5
-    done
-    
-    log_error "Не удалось восстановить микрофон после $max_attempts попыток" "mic_restore_failed" "mic_restore"
-    return 1
-}
-
 # Функция настройки микрофона (простая настройка для arecord)
 setup_mic() {
     printf "${BOLD}${BLUE}■ Использование микрофона по умолчанию...${RESET}\n"
@@ -397,7 +350,7 @@ process_recorded_file() {
         file_size=$(stat -c%s "$file" 2>/dev/null || echo 0)
         
         if [ "$file_size" -lt 1024 ]; then
-            log_error "$file_name слишком маленький (${file_size} байт): $file" "${file_name,,}_too_small" "overlap_recording"
+            log_error "$file_name слишком маленький (${file_size} байт): $file" "${file_name,,}_too_small" "recording"
             rm -f "$file"
         else
             # Обрабатываем файл
@@ -406,7 +359,7 @@ process_recorded_file() {
                     log_message "$file_name успешно загружен: $file"
                 else
                     if ! queue_for_upload "$file"; then
-                        log_error "Не удалось добавить $file_name в очередь: $file" "${file_name,,}_queue_failed" "overlap_recording"
+                        log_error "Не удалось добавить $file_name в очередь: $file" "${file_name,,}_queue_failed" "recording"
                     fi
                 fi
             fi
@@ -414,119 +367,41 @@ process_recorded_file() {
     fi
 }
 
-# Функция проверки и восстановления микрофона
-check_and_restore_microphone() {
-    local context="$1"
-    
-    if ! check_microphone_health; then
-        log_message "Проблема с микрофоном ($context), попытка восстановления..."
-        if restore_microphone; then
-            log_message "Микрофон успешно восстановлен"
-            return 0
-        else
-            log_message "КРИТИЧЕСКАЯ ОШИБКА: Не удалось восстановить микрофон ($context)"
-            if command -v systemctl >/dev/null 2>&1; then
-                systemctl restart arec.service
-            fi
-            handle_critical_error "Не удалось восстановить микрофон ($context)" 1 "mic_restore"
-        fi
-    fi
-    return 0
-}
-
-
-# Функция запуска записи с перекрытием через arecord
-start_overlapping_recording() {
+# Функция запуска записи через arecord
+start_recording() {
     local file="$1"
     local duration="$2"
-    local arecord_pid_var="$3"
     
-    log_message "Запуск перекрывающей записи: $file (длительность: ${duration}с)"
+    log_message "Запуск записи: $file (длительность: ${duration}с)"
     
-    # Запускаем arecord + ffmpeg в фоне
+    # Запускаем arecord + ffmpeg
     case "$AUDIO_FORMAT" in
         aac)
             arecord -D "$MIC" -f "$SAMPLE_FORMAT" -r "$SAMPLE_RATE" -d "$duration" --quiet - 2>> "$LOG_FILE" | \
-            ffmpeg -y -i - -c:a aac -b:a "${BITRATE}k" -ac 1 "$file" -hide_banner -loglevel error 2>> "$LOG_FILE" &
+            ffmpeg -y -i - -c:a aac -b:a "${BITRATE}k" -ac 1 "$file" -hide_banner -loglevel error 2>> "$LOG_FILE"
             ;;
         opus)
             arecord -D "$MIC" -f "$SAMPLE_FORMAT" -r "$SAMPLE_RATE" -d "$duration" --quiet - 2>> "$LOG_FILE" | \
-            ffmpeg -y -i - -c:a libopus -b:a "${BITRATE}k" -application voip -ac 1 "$file" -hide_banner -loglevel error 2>> "$LOG_FILE" &
+            ffmpeg -y -i - -c:a libopus -b:a "${BITRATE}k" -application voip -ac 1 "$file" -hide_banner -loglevel error 2>> "$LOG_FILE"
             ;;
         mp3)
             arecord -D "$MIC" -f "$SAMPLE_FORMAT" -r "$SAMPLE_RATE" -d "$duration" --quiet - 2>> "$LOG_FILE" | \
-            ffmpeg -y -i - -c:a libmp3lame -b:a "${BITRATE}k" -q:a 5 -ac 1 "$file" -hide_banner -loglevel error 2>> "$LOG_FILE" &
+            ffmpeg -y -i - -c:a libmp3lame -b:a "${BITRATE}k" -q:a 5 -ac 1 "$file" -hide_banner -loglevel error 2>> "$LOG_FILE"
             ;;
         *)
-            log_error "Неверный формат аудио: $AUDIO_FORMAT" "invalid_audio_format" "overlap_recording"
+            log_error "Неверный формат аудио: $AUDIO_FORMAT" "invalid_audio_format" "recording"
             return 1
             ;;
     esac
     
-    # Сохраняем PID процесса
-    eval "$arecord_pid_var=$!"
-    local pid
-    eval "pid=\$$arecord_pid_var"
-    
-    # Проверяем, что процесс запустился
-    if ! kill -0 "$pid" 2>/dev/null; then
-        log_error "arecord не удалось запустить для перекрывающей записи: $file" "arecord_start_failed" "overlap_recording"
-        return 1
-    fi
-    
-    log_message "Перекрывающая запись запущена (PID: $pid): $file"
-    return 0
-}
-
-# Функция ожидания завершения arecord с таймаутом
-wait_for_arecord() {
-    local pid="$1"
-    local timeout="$2"
-    local file="$3"
-    local start_time
-    start_time=$(date +%s)
-    
-    while kill -0 "$pid" 2>/dev/null; do
-        local current_time
-        current_time=$(date +%s)
-        local elapsed=$((current_time - start_time))
-        
-        if [ $elapsed -gt $timeout ]; then
-            log_error "Таймаут ожидания завершения arecord (${timeout}с): $file" "arecord_timeout" "overlap_recording"
-            kill -TERM "$pid" 2>/dev/null
-            sleep 2
-            kill -KILL "$pid" 2>/dev/null
-            return 1
-        fi
-        
-        sleep 1
-    done
-    
-    # Получаем код завершения
-    wait "$pid"
     local exit_code=$?
-    
     if [ $exit_code -ne 0 ]; then
-        log_error "arecord завершился с ошибкой (код: $exit_code): $file" "$exit_code" "overlap_recording"
+        log_error "Ошибка записи (код: $exit_code): $file" "$exit_code" "recording"
         return 1
     fi
     
+    log_message "Запись завершена: $file"
     return 0
-}
-
-
-# Функция отображения прогресса записи (упрощенная для Pi Zero 2 W)
-show_progress() {
-    local duration=$1 start=$(date +%s)
-    while true; do
-        elapsed=$(($(date +%s)-start))
-        [ $elapsed -ge $duration ] && break
-        percent=$((elapsed*100/duration))
-        # Упрощенный прогресс (меньше вычислений)
-        printf "\r${BOLD}${BLUE}⌛ ${GREEN}%3d%%${RESET}" $percent
-        sleep 5  # Обновляем каждые 5 секунд вместо 1
-    done
-    printf "\r\033[K" # Очищаем строку прогресса
 }
 
 # Универсальная функция загрузки файла в облако (адаптивная для нестабильной сети)
@@ -822,10 +697,8 @@ else
 fi
 
 LAST_CONNECTIVITY_CHECK=0
-LAST_MIC_CHECK=0
-MIC_CHECK_INTERVAL=300  # Проверка микрофона каждые 5 минут
 
-# Основной цикл записи с перекрытием
+# Основной цикл записи
 while true; do
     # Периодически проверяем интернет и обрабатываем очередь
     current_time=$(date +%s)
@@ -842,89 +715,30 @@ while true; do
         fi
     fi
 
-    # Периодически проверяем состояние микрофона
-    if [ $((current_time - LAST_MIC_CHECK)) -ge "$MIC_CHECK_INTERVAL" ]; then
-        LAST_MIC_CHECK="$current_time"
-        check_and_restore_microphone "периодическая проверка"
-    fi
-
     # Проверяем размер очереди и очищаем старые файлы при необходимости
     check_queue_size
     cleanup_old_files
-
-    # Проверяем состояние микрофона перед началом записи
-    check_and_restore_microphone "перед записью"
 
     # Генерируем временную метку и имя файла с правильным расширением
     TS=$(date +"%Y%m%d_%H%M%S")
     FILE="${OUTPUT_DIR}/REC_${TS}.${AUDIO_FORMAT}"
 
-    log_message "Начало записи с перекрытием: $FILE"
+    log_message "Начало записи: $FILE"
 
     # Создаём маркер восстановления перед началом записи
     create_recovery_marker "$FILE"
 
-    # Запускаем первый файл
-    arecord_pid1=""
-    if ! start_overlapping_recording "$FILE" "$SPLIT_TIME" "arecord_pid1"; then
+    # Запускаем запись
+    if ! start_recording "$FILE" "$SPLIT_TIME"; then
         remove_recovery_marker "$FILE"
-        handle_critical_error "Не удалось запустить первую запись" 1 "overlap_recording"
+        handle_critical_error "Не удалось запустить запись" 1 "recording"
     fi
 
-    # Ждем до момента перекрытия
-    overlap_start_time=$((SPLIT_TIME - OVERLAP_TIME))
-    printf "${BLUE}⏳ Ожидание перекрытия (${overlap_start_time}с)...${RESET}\n"
-    sleep "$overlap_start_time"
+    # Удаляем маркер восстановления после успешной записи
+    remove_recovery_marker "$FILE"
 
-    # Генерируем имя для второго файла
-    TS2=$(date +"%Y%m%d_%H%M%S")
-    FILE2="${OUTPUT_DIR}/REC_${TS2}.${AUDIO_FORMAT}"
+    # Обрабатываем записанный файл
+    process_recorded_file "$FILE" "Файл"
 
-    log_message "Запуск перекрывающей записи: $FILE2"
-
-    # Создаём маркер восстановления для второго файла
-    create_recovery_marker "$FILE2"
-
-    # Запускаем второй файл с перекрытием
-    arecord_pid2=""
-    if ! start_overlapping_recording "$FILE2" "$SPLIT_TIME" "arecord_pid2"; then
-        remove_recovery_marker "$FILE2"
-        log_error "Не удалось запустить перекрывающую запись: $FILE2" "overlap_start_failed" "overlap_recording"
-        # Продолжаем с первым файлом
-    else
-        printf "${GREEN}✅ Перекрывающая запись запущена: $FILE2${RESET}\n"
-    fi
-
-    # Ждем завершения первого файла
-    printf "${BLUE}⏳ Завершение первого файла (${OVERLAP_TIME}с)...${RESET}\n"
-    if ! wait_for_arecord "$arecord_pid1" $((OVERLAP_TIME + 10)) "$FILE"; then
-        log_error "Ошибка завершения первого файла: $FILE" "first_file_error" "overlap_recording"
-        remove_recovery_marker "$FILE"
-    else
-        # Удаляем маркер восстановления после успешной записи
-        remove_recovery_marker "$FILE"
-        log_message "Первый файл завершен: $FILE"
-    fi
-
-    # Проверяем первый файл
-    process_recorded_file "$FILE" "Первый файл"
-
-    # Ждем завершения второго файла
-    printf "${BLUE}⏳ Завершение второго файла...${RESET}\n"
-    if ! wait_for_arecord "$arecord_pid2" $((OVERLAP_TIME + 10)) "$FILE2"; then
-        log_error "Ошибка завершения второго файла: $FILE2" "second_file_error" "overlap_recording"
-        remove_recovery_marker "$FILE2"
-    else
-        # Удаляем маркер восстановления после успешной записи
-        remove_recovery_marker "$FILE2"
-        log_message "Второй файл завершен: $FILE2"
-    fi
-
-    # Проверяем второй файл
-    process_recorded_file "$FILE2" "Второй файл"
-
-    # Проверяем состояние микрофона после записи
-    check_and_restore_microphone "после записи"
-
-    printf "${GREEN}✅ Цикл перекрывающей записи завершен${RESET}\n"
+    printf "${GREEN}✅ Запись завершена: $FILE${RESET}\n"
 done
