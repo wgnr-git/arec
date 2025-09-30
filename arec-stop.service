@@ -1,0 +1,12 @@
+[Unit]
+Description=Stop AREC Audio Recording Service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl stop arec.service
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
