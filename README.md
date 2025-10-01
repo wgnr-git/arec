@@ -1,5 +1,4 @@
-# AREC - Car Audio Recorder
-
+# AREC - Audio Recorder
 Automated audio recording script for Raspberry Pi Zero 2 W in car environment.
 
 ## Features
